@@ -101,13 +101,54 @@ export function limitHistoryTurns(
 - 最多尝试 3 次自动压缩（`MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3`）
 - 压缩超时限制 5 分钟（`EMBEDDED_COMPACTION_TIMEOUT_MS = 300_000`）
 
-### 2.4 Tool Result 截断
+### 2.4 Context Pruning（上下文裁剪扩展）
+
+**文件**: `src/agents/pi-extensions/context-pruning/settings.ts`
+
+除 compaction 外，还有一个**独立的 context pruning 扩展**，基于 cache TTL 对旧的工具返回结果进行裁剪：
+
+```typescript
+export const DEFAULT_CONTEXT_PRUNING_SETTINGS = {
+  mode: "cache-ttl",
+  ttlMs: 5 * 60 * 1000,           // 5 分钟 TTL
+  keepLastAssistants: 3,           // 始终保留最近 3 条 assistant 消息
+  softTrimRatio: 0.3,              // 上下文占用 30% 时软裁剪
+  hardClearRatio: 0.5,             // 上下文占用 50% 时硬清除
+  minPrunableToolChars: 50_000,    // 工具返回 >50KB 才触发裁剪
+  softTrim: {
+    maxChars: 4_000,               // 软裁剪后最大保留 4KB
+    headChars: 1_500,              // 保留开头 1.5KB
+    tailChars: 1_500,              // 保留末尾 1.5KB
+  },
+  hardClear: {
+    enabled: true,
+    placeholder: "[Old tool result content cleared]",
+  },
+};
+```
+
+这意味着：超过 5 分钟的旧工具返回结果，如果占用上下文超过 30%，会被截断为头尾各 1.5KB；超过 50% 时直接替换为占位符。
+
+### 2.5 Group Chat 历史限制
+
+**文件**: `src/auto-reply/reply/history.ts`
+
+群聊场景有额外的历史限制机制：
+
+```typescript
+export const DEFAULT_GROUP_HISTORY_LIMIT = 50;   // 默认保留最近 50 条群聊消息
+export const MAX_HISTORY_KEYS = 1000;             // 最多追踪 1000 个群聊 key（LRU 淘汰）
+```
+
+当群聊历史 key 超过 1000 个时，采用 LRU 策略淘汰最旧的记录。
+
+### 2.6 Tool Result 截断
 
 **文件**: `src/agents/pi-embedded-runner/tool-result-truncation.ts`
 
 过大的工具返回结果会被截断，以避免占用过多 context 空间。
 
-### 2.5 小结：每次交互实际携带多少消息
+### 2.7 小结：每次交互实际携带多少消息
 
 | 场景 | 携带的历史消息量 |
 |------|----------------|
@@ -116,6 +157,8 @@ export function limitHistoryTurns(
 | 配置了 historyLimit=N | 最近 N 轮 user turn 及关联响应 |
 | 上下文接近溢出 | SDK 自动触发 compaction，用摘要替代旧消息 |
 | 上下文已溢出 | 最多 3 次自动 compaction 重试 |
+| 群聊会话 | 额外限制最近 50 条群消息（DEFAULT_GROUP_HISTORY_LIMIT） |
+| 旧 tool result（>5min） | context pruning 自动截断或清除 |
 
 ---
 
@@ -375,3 +418,5 @@ agents:
 | `src/auto-reply/reply/session.ts` | 会话初始化与新鲜度判定 |
 | `src/cron/session-reaper.ts` | Cron 会话清理 |
 | `src/agents/pi-embedded-runner/session-manager-cache.ts` | Session 文件缓存 |
+| `src/agents/pi-extensions/context-pruning/settings.ts` | Context pruning 配置与默认值 |
+| `src/auto-reply/reply/history.ts` | 群聊消息历史管理（50条默认，1000 key LRU） |
