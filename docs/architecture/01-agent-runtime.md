@@ -146,10 +146,31 @@ const ACTIVE_EMBEDDED_RUNS = new Map<string, EmbeddedPiQueueHandle>();
 
 **等待机制**: `waitForEmbeddedPiRunEnd()` 支持超时等待（默认 15 秒），使用 waiter 集合通知所有等待者。
 
-### 2.6 安全处理
+### 2.6 前置钩子与安全处理
 
+**运行前钩子**:
+- `before_model_resolve`: 允许覆盖 Provider/Model 选择
+- `before_agent_start`: 允许在 Agent 启动前修改参数
+
+**安全处理**:
 - **Anthropic 拒绝魔法字符串**: 自动将 `ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL` 替换为脱敏版本，防止会话污染
 - **工具结果截断**: `truncateOversizedToolResultsInSession()` 在运行前截断超大工具结果
+- **Google 转次修复**: `sanitizeAntigravityThinkingBlocks()` + `sanitizeSessionHistory()` 清理 Google 模型的会话历史
+
+### 2.7 错误处理与重试
+
+**上下文溢出重试**:
+- 检测: `isLikelyContextOverflowError()` 分析 `promptError` 和 `assistantErrorText`
+- 最大重试: `MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3`
+- 重试策略: 会话压缩 → 工具结果截断 → 放弃
+
+**思考级别降级**:
+- 当模型拒绝当前思考级别时，通过 `pickFallbackThinkingLevel()` 自动降级重试
+
+**压缩超时处理**:
+- `timedOutDuringCompaction` 标志区分压缩超时与提示词超时
+- 超时时保留压缩前快照，避免消息丢失
+- 超时错误不触发认证轮换
 
 ## 3. 多 Agent 系统
 
@@ -165,15 +186,66 @@ OpenClaw 支持多 Agent 配置：
 
 位于 `src/agents/subagent-*.ts`：
 
-- **subagent-registry.ts**: 子 Agent 注册表，管理子 Agent 生命周期
-- **subagent-spawn.ts**: 子 Agent 生成逻辑
-- **subagent-depth.ts**: 子 Agent 嵌套深度限制
-- **subagent-announce.ts**: 子 Agent 结果通知
+| 文件 | 职责 |
+|------|------|
+| `subagent-spawn.ts` | 子 Agent 生成逻辑 |
+| `subagent-registry.ts` | 子 Agent 注册表，管理生命周期 |
+| `subagent-depth.ts` | 嵌套深度限制 |
+| `subagent-announce.ts` | 结果通知与重试 |
 
-子 Agent 支持：
-- 独立的会话上下文
-- 深度限制防止无限递归
-- 结果通过通知队列返回给父 Agent
+#### 生成参数与结果
+
+```typescript
+type SpawnSubagentParams = {
+  task: string;                      // 子 Agent 任务描述
+  label?: string;                    // 显示标签
+  agentId?: string;                  // 目标 Agent ID
+  model?: string;                    // 模型覆盖
+  thinking?: string;                 // 思考级别覆盖
+  runTimeoutSeconds?: number;
+  cleanup?: "delete" | "keep";       // 完成后清理策略
+  expectsCompletionMessage?: boolean;
+};
+
+type SpawnSubagentResult = {
+  status: "accepted" | "forbidden" | "error";
+  childSessionKey?: string;
+  runId?: string;
+};
+```
+
+#### 安全限制
+
+| 限制 | 默认值 | 配置路径 |
+|------|--------|---------|
+| 最大嵌套深度 | 1 | `agents.defaults.subagents.maxSpawnDepth` |
+| 每个父会话最大子 Agent | 5 | `agents.defaults.subagents.maxChildrenPerAgent` |
+| 允许目标 Agent | 白名单 | `subagents.allowAgents`（`*` 允许全部） |
+
+#### 生成流程
+
+1. **深度/子数验证** — 超过限制返回 `status: "forbidden"`
+2. **Agent 权限检查** — `allowAgents` 白名单过滤
+3. **会话创建** — 子会话 key 格式: `agent:{targetAgentId}:subagent:{uuid}`
+4. **系统提示词注入** — 包含深度信息的子 Agent 上下文
+5. **Gateway 调用** — 通过 `AGENT_LANE_SUBAGENT` lane 执行
+6. **注册表登记** — `registerSubagentRun()` 跟踪状态
+
+#### 注册表与生命周期
+
+`SubagentRunRecord` 追踪完整生命周期: `创建 → 启动 → 结束 → 通知 → 清理 → 归档`
+
+**通知重试机制** (announce):
+- 指数退避: 1s → 2s → 4s → 8s (上限)
+- 最多 3 次重试，5 分钟后强制过期
+- `suppressAnnounceReason` 可抑制通知（如 `"killed"`, `"steer-restart"`）
+
+**清理与归档**:
+- `cleanup: "delete"`: 通知后删除子会话
+- `cleanup: "keep"`: 保留会话在注册表中
+- 默认 60 分钟后归档（`subagents.archiveAfterMinutes`）
+
+**后代计数**: `countActiveDescendantRuns()` 使用 BFS 递归统计所有活跃后代（非仅直接子代），带 `visited` 集合防环
 
 ### 3.3 Agent 工作区 (`src/agents/workspace.ts`)
 
@@ -192,6 +264,18 @@ OpenClaw 支持多 Agent 配置：
 - 自动轮换 API 密钥
 - 冷却期管理 (失败后自动暂停使用)
 - 支持 Anthropic、OpenAI、Google、HuggingFace 等供应商
+
+**配置轮换流程**:
+1. 用户选择的 Profile (`authProfileIdSource === "user"`) 锁定，不参与轮换
+2. `isProfileInCooldown()` 跳过冷却期内的 Profile
+3. `advanceAuthProfile()` 在失败后迭代候选列表
+4. `markAuthProfileFailure()` 标记失败，触发冷却期
+5. `markAuthProfileGood()` / `markAuthProfileUsed()` 标记成功
+
+**冷却期探测**:
+- 探测间隔: `MIN_PROBE_INTERVAL_MS = 30_000`（每 30 秒最多一次）
+- 提前探测窗口: `PROBE_MARGIN_MS = 2 * 60_000`（冷却期结束前 2 分钟可探测）
+- 探测 key: `${agentDir}::${provider}`（按作用域隔离）
 
 ### 4.2 模型目录 (`src/agents/model-catalog.ts`)
 
