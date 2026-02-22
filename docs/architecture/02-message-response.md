@@ -120,35 +120,147 @@ bindings: [
 
 ### 3.1 回复获取 (`src/auto-reply/reply/get-reply.ts`)
 
-`getReplyFromConfig()` 从配置中解析回复参数：
+`getReplyFromConfig()` 是回复系统的核心入口：
 
-- 提取消息中的指令标记 (directives)
-- 解析回复目标
-- 应用模板引擎
+```typescript
+async function getReplyFromConfig(
+  ctx: MsgContext,
+  opts?: GetReplyOptions,
+  configOverride?: OpenClawConfig,
+): Promise<ReplyPayload | ReplyPayload[] | undefined>
+```
+
+**回复解析流程**：
+
+1. **会话解析**: 使用 `CommandTargetSessionKey`（原生命令）或回退到 `SessionKey`
+2. **模型选择**: 通过 `resolveDefaultModel()` 解析默认供应商/模型，然后依次应用：
+   - 心跳模型覆盖 (`opts.isHeartbeat`)
+   - 通道模型覆盖 (`resolveChannelModelOverride()`)
+   - 重置模型覆盖 (`applyResetModelOverride()`)
+3. **工作区设置**: 通过 `ensureAgentWorkspace()` 确保 Agent 工作区就绪
+4. **Skill 过滤合并**: `mergeSkillFilters()` 合并通道和 Agent 的 Skill 过滤器（取交集）
+5. **打字控制器**: 通过 `createTypingController()` 初始化，默认间隔 6 秒
+
+**回复负载链**：
+1. `resolveReplyDirectives()` — 检查是否有需要提前返回的指令回复
+2. `handleInlineActions()` — 处理内联命令/技能
+3. `stageSandboxMedia()` — 准备沙箱媒体
+4. `runPreparedReply()` — 执行主 Agent 回复
+
+**关键回复选项** (`GetReplyOptions`)：
+
+```typescript
+type GetReplyOptions = {
+  runId?: string;
+  abortSignal?: AbortSignal;
+  images?: ImageContent[];
+  isHeartbeat?: boolean;
+  onPartialReply?: (payload: ReplyPayload) => Promise<void> | void;
+  onBlockReply?: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
+  onToolStart?: (payload: { name?: string; phase?: string }) => Promise<void> | void;
+  onModelSelected?: (ctx: ModelSelectedContext) => void;
+  skillFilter?: string[];
+  timeoutOverrideSeconds?: number;
+  // ... 更多回调
+};
+```
+
+**特殊令牌**：
+
+```typescript
+const HEARTBEAT_TOKEN = "HEARTBEAT_OK";   // 心跳回复标记
+const SILENT_REPLY_TOKEN = "NO_REPLY";    // 静默回复标记
+```
 
 ### 3.2 指令解析 (`src/auto-reply/reply/directives.ts`)
 
-支持从消息中提取特殊指令：
+用户可在消息中嵌入 `/directive` 格式的指令来控制 Agent 行为：
 
-- `extractThinkDirective()`: 提取 `!think` 指令控制推理深度
-- `extractReasoningDirective()`: 推理级别指令
-- `extractElevatedDirective()`: 提升权限指令
-- `extractVerboseDirective()`: 详细输出指令
-- `extractExecDirective()`: 执行命令指令
-- `extractQueueDirective()`: 队列指令
+| 指令 | 别名 | 有效级别 | 说明 |
+|------|------|---------|------|
+| `/think` | `/t` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` | 控制推理深度 |
+| `/verbose` | `/v` | `off`, `on`, `full` | 详细输出控制 |
+| `/notice` | `/notices` | `off`, `on`, `full` | 通知级别 |
+| `/elevated` | `/elev` | `off`, `on`, `ask`, `full` | 提升权限 |
+| `/reasoning` | `/reason` | `off`, `on`, `stream` | 推理过程输出 |
+| `/status` | — | （简单开关） | 状态显示 |
+
+**指令提取模式**：
+
+```typescript
+// 匹配模式: (?:^|\s)/directive(?=$|\s|:)(?:\s*:\s*)?level?
+// 示例: "/think: high" → { level: "high", hasDirective: true }
+// 清理逻辑: 将指令替换为空格，规范化多余空格
+```
+
+**综合指令结果** (`InlineDirectives`)：
+
+```typescript
+type InlineDirectives = {
+  cleaned: string;                // 清理后的消息文本
+  hasThinkDirective: boolean;
+  thinkLevel?: ThinkLevel;
+  hasVerboseDirective: boolean;
+  hasReasoningDirective: boolean;
+  hasElevatedDirective: boolean;
+  hasModelDirective: boolean;     // 模型切换指令
+  hasQueueDirective: boolean;     // 队列控制指令
+  queueMode?: QueueMode;
+  debounceMs?: number;
+  // ... 更多字段
+};
+```
 
 ### 3.3 回复标签 (`src/auto-reply/reply/reply-tags.ts`)
 
 `extractReplyToTag()` 从消息中解析 `@reply` 标签，确定回复目标。
 
+**回复指令解析结果**：
+
+```typescript
+type ReplyDirectiveParseResult = {
+  text: string;
+  mediaUrls?: string[];
+  replyToId?: string;
+  replyToCurrent: boolean;     // [[reply_to_current]] 占位符
+  replyToTag: boolean;
+  audioAsVoice?: boolean;      // 作为语音气泡发送
+  isSilent: boolean;
+};
+```
+
 ### 3.4 模板引擎 (`src/auto-reply/templating.ts`)
 
-`applyTemplate()` 支持在回复中使用变量模板：
+`applyTemplate()` 使用 `{{Placeholder}}` 语法支持丰富的变量模板：
 
-- `{{sender}}` — 发送者名称
-- `{{channel}}` — 当前通道
-- `{{time}}` — 当前时间
-- 自定义变量
+```typescript
+function applyTemplate(str: string | undefined, ctx: TemplateContext) {
+  return str.replace(/{{\s*(\w+)\s*}}/g, (_, key) => {
+    const value = ctx[key as keyof TemplateContext];
+    return formatTemplateValue(value);
+  });
+}
+```
+
+**可用模板变量**：
+
+| 分类 | 变量 | 说明 |
+|------|------|------|
+| **发送者** | `From`, `SenderName`, `SenderUsername`, `SenderId`, `SenderTag` | 发送者身份信息 |
+| **消息内容** | `Body`, `BodyForAgent`, `CommandBody`, `CommandArgs` | 消息文本 |
+| **回复上下文** | `ReplyToSender`, `ReplyToBody`, `ReplyToId` | 被回复消息 |
+| **线程** | `ThreadStarterBody`, `ThreadHistoryBody`, `IsFirstThreadTurn` | 线程上下文 |
+| **群组** | `GroupSubject`, `GroupChannel`, `GroupSpace`, `GroupMembers` | 群组信息 |
+| **媒体** | `MediaPath`, `MediaUrl`, `MediaType`, `MediaPaths[]` | 附件媒体 |
+| **会话** | `SessionKey`, `SessionId`, `IsNewSession` | 会话状态 |
+| **系统** | `Provider`, `Surface`, `ChatType`, `OriginatingChannel` | 通道信息 |
+| **转发** | `ForwardedFromType`, `ForwardedFromId`, `ForwardedFromUsername` | 转发消息源 |
+
+**值格式化规则**：
+- `null/undefined` → 空字符串
+- `string` → 原样输出
+- `Array` → 逗号拼接（跳过 null 和非原始值）
+- `object` → 空字符串
 
 ## 4. Agent 消息处理
 
@@ -177,7 +289,7 @@ bindings: [
 7. **工具调用**: 执行 LLM 请求的工具操作
 8. **结果处理**: 收集完整响应并持久化
 
-### 4.3 流式订阅 (`src/agents/pi-embedded-subscribe.ts`)
+### 4.3 流式订阅与软分块 (`src/agents/pi-embedded-subscribe.ts`)
 
 `subscribeEmbeddedPiSession()` 管理 LLM 响应流的处理：
 
@@ -186,10 +298,36 @@ bindings: [
 - **压缩处理** (`handlers.compaction.ts`): 自动压缩触发
 - **生命周期** (`handlers.lifecycle.ts`): 运行开始/结束事件
 
-流式输出优化：
-- 软分块 (soft chunks): 按段落偏好分割长回复
-- 代码块感知: 保持围栏代码块完整
-- 重新打开代码块: 跨分块边界时自动重新打开
+**文本流事件类型**：
+- `text_start`, `text_delta`, `text_end` — 文本流事件
+- `thinking_start`, `thinking_delta`, `thinking_end` — 扩展思考事件
+- Delta 去重: 与之前内容比较避免重复发送
+
+**软分块算法** (`EmbeddedBlockChunker`)：
+
+```typescript
+type BlockReplyChunking = {
+  minChars: number;      // 最小字符数 (默认 800)
+  maxChars: number;      // 硬性上限 (默认 1200)
+  breakPreference?: "paragraph" | "newline" | "sentence";
+  flushOnParagraph?: boolean;  // 段落即刻刷出
+};
+```
+
+**分块优先级**（从高到低）：
+1. **段落** (`\n\n`) — 最安全，保持结构
+2. **换行** (`\n`) — 中等优先级
+3. **句子** (`[.!?](?=\s|$)`) — 回退选项
+4. **硬切割** — 在 maxChars 处强制分割，处理围栏
+
+**围栏代码块安全**：
+- 通过 `parseFenceSpans()` 解析代码围栏
+- 从不在围栏内部断开（关闭围栏，在下一块重新打开）
+- `isSafeFenceBreak()` 验证分割位置
+- 维护 `FenceSpan[]` 跟踪各围栏的语言、起止位置
+
+**段落排空模式** (`flushOnParagraph=true`)：
+完整段落即使小于 minChars 也立即发出，减少延迟。
 
 ## 5. 回复派发
 
@@ -261,23 +399,140 @@ Agent 生成回复 → createFeishuReplyDispatcher()
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## 7. 钩子系统 (`src/hooks/`)
+## 7. 通道访问控制
 
-### 7.1 全局钩子
+### 7.1 允许列表 (`src/channels/allow-from.ts`)
+
+```typescript
+function mergeAllowFromSources(params: {
+  allowFrom?: Array<string | number>;
+  storeAllowFrom?: string[];
+}): string[]
+
+function isSenderIdAllowed(
+  allow: { entries: string[]; hasWildcard: boolean; hasEntries: boolean },
+  senderId: string | undefined,
+  allowWhenEmpty: boolean,
+): boolean
+// 返回 true: 无条目(allowWhenEmpty)、通配符匹配、或 senderId 在列表中
+```
+
+### 7.2 命令门控 (`src/channels/command-gating.ts`)
+
+控制用户是否有权执行文本命令：
+
+```typescript
+type CommandGatingModeWhenAccessGroupsOff = "allow" | "deny" | "configured";
+
+function resolveControlCommandGate(params: {
+  useAccessGroups: boolean;
+  authorizers: CommandAuthorizer[];
+  allowTextCommands: boolean;
+  hasControlCommand: boolean;
+  modeWhenAccessGroupsOff?: CommandGatingModeWhenAccessGroupsOff;
+}): { commandAuthorized: boolean; shouldBlock: boolean }
+// shouldBlock = allowTextCommands && hasControlCommand && !commandAuthorized
+```
+
+**访问组逻辑**：
+- `useAccessGroups=false` + `"allow"` → 始终允许
+- `useAccessGroups=false` + `"deny"` → 始终拒绝
+- `useAccessGroups=false` + `"configured"` → 任一 authorizer 已配置且允许时通过
+- `useAccessGroups=true` → 任一 authorizer 已配置且允许时通过
+
+### 7.3 提及门控 (`src/channels/mention-gating.ts`)
+
+控制群组中是否需要 @提及 才响应：
+
+```typescript
+function resolveMentionGating(params: {
+  requireMention: boolean;
+  canDetectMention: boolean;
+  wasMentioned: boolean;
+  implicitMention?: boolean;
+  shouldBypassMention?: boolean;
+}): { effectiveWasMentioned: boolean; shouldSkip: boolean }
+```
+
+**有效提及** = `wasMentioned || implicitMention || shouldBypassMention`
+**跳过** = `requireMention && canDetectMention && !effectiveWasMentioned`
+
+**控制命令绕过**：群组中未被提及但发送了已授权的控制命令时，自动绕过提及要求。
+
+### 7.4 确认反应 (`src/channels/ack-reactions.ts`)
+
+支持通过表情反应确认消息已接收：
+
+```typescript
+type AckReactionScope = "all" | "direct" | "group-all" | "group-mentions" | "off" | "none";
+```
+
+| 作用域 | 行为 |
+|-------|------|
+| `all` | 始终反应 |
+| `direct` | 仅在私聊中反应 |
+| `group-all` | 在所有群组中反应 |
+| `group-mentions` | 仅在群组中被提及时反应 |
+| `off` / `none` | 从不反应 |
+
+支持回复后自动移除确认反应 (`removeAckReactionAfterReply`)。
+
+## 8. 钩子系统 (`src/hooks/`)
+
+### 8.1 钩子类型
 
 钩子在消息处理管线中提供拦截点：
 
-- **before-tool-call**: 工具执行前触发
-- **after-tool-call**: 工具执行后触发
-- **gateway-stop**: Gateway 停止前触发
+| 事件类型 | 动作示例 | 说明 |
+|---------|---------|------|
+| `command` | `new`, `reset` | 命令执行 |
+| `session` | `reset`, `bootstrap` | 会话生命周期 |
+| `agent` | — | Agent 操作 |
+| `gateway` | `startup`, `stop` | Gateway 生命周期 |
+| `message` | `received`, `sent` | 消息收发 |
 
-### 7.2 钩子运行器 (`src/plugins/hook-runner-global.ts`)
+### 8.2 钩子注册与触发
 
-`getGlobalHookRunner()` 返回全局钩子运行器，执行所有已注册的钩子。
+```typescript
+function registerInternalHook(eventKey: string, handler: InternalHookHandler): void
+// eventKey: "type" 或 "type:action" (如 "command:new", "session:reset")
 
-## 8. 并发控制
+async function triggerInternalHook(event: InternalHookEvent): Promise<void>
+// 调用所有匹配的处理器；错误被捕获并记录，不阻止后续处理器
+```
 
-### 8.1 Lane 并发系统
+**钩子事件结构**：
+
+```typescript
+interface InternalHookEvent {
+  type: InternalHookEventType;
+  action: string;
+  sessionKey: string;
+  context: Record<string, unknown>;
+  timestamp: Date;
+  messages: string[];    // 钩子可向此数组推送消息
+}
+```
+
+### 8.3 回复前缀 (`src/channels/reply-prefix.ts`)
+
+在多 Agent 环境中，回复可添加 Agent 标识前缀：
+
+```typescript
+type ResponsePrefixContext = {
+  identityName?: string;    // Agent 名称
+  provider?: string;        // LLM 供应商
+  model?: string;           // 模型短名称
+  modelFull?: string;       // 完整模型标识
+  thinkingLevel?: string;   // 思考级别
+};
+```
+
+前缀在模型选择后通过 `onModelSelected` 回调动态更新。
+
+## 9. 并发控制
+
+### 9.1 Lane 并发系统
 
 `src/agents/lanes.ts` 和 `src/agents/pi-embedded-runner/lanes.ts` 实现了 Lane 并发机制：
 
@@ -286,7 +541,7 @@ Agent 生成回复 → createFeishuReplyDispatcher()
 - 跨 Lane 可并行处理
 - 全局 Lane 限制防止过载
 
-### 8.2 命令队列 (`src/process/command-queue.ts`)
+### 9.2 命令队列 (`src/process/command-queue.ts`)
 
 通过 `enqueueCommandInLane()` 将 Agent 运行排入队列：
 

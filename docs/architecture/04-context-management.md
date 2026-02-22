@@ -11,27 +11,33 @@ OpenClaw 的上下文管理系统负责维护 Agent 与用户之间的对话上�
 每个 LLM 模型有不同的上下文窗口大小，系统通过多种方式获取：
 
 ```typescript
-// 常量定义
-const CONTEXT_WINDOW_HARD_MIN_TOKENS = 4096;    // 硬性最小值
-const CONTEXT_WINDOW_WARN_BELOW_TOKENS = 16384; // 警告阈值
+const CONTEXT_WINDOW_HARD_MIN_TOKENS = 16_000;  // 硬性最小值 (低于此则阻止运行)
+const CONTEXT_WINDOW_WARN_BELOW_TOKENS = 32_000; // 警告阈值
+
+type ContextWindowSource = "model" | "modelsConfig" | "agentContextTokens" | "default";
 ```
 
-`resolveContextWindowInfo()` 解析当前模型的上下文窗口参数：
+`resolveContextWindowInfo()` 解析当前模型的上下文窗口参数，优先级从高到低：
 
-1. 优先使用配置中的自定义值
-2. 其次使用模型目录中的发现值
-3. 默认回退到 `DEFAULT_CONTEXT_TOKENS`
+1. **modelsConfig**: 用户在 `config.models.providers[provider].models` 中指定的 `contextWindow`
+2. **model**: 模型自身报告的上下文窗口（模型发现值）
+3. **default**: `DEFAULT_CONTEXT_TOKENS` 回退默认值
+4. **agentContextTokens 上限**: 若 `config.agents.defaults.contextTokens` 存在且更小，则覆盖
 
 ### 1.2 上下文窗口守卫
 
-`evaluateContextWindowGuard()` 评估是否需要触发上下文压缩：
+`evaluateContextWindowGuard()` 评估当前上下文窗口是否安全：
 
+```typescript
+type ContextWindowGuardResult = ContextWindowInfo & {
+  shouldWarn: boolean;   // tokens > 0 && tokens < warnBelow (32K)
+  shouldBlock: boolean;  // tokens > 0 && tokens < hardMin (16K)
+};
 ```
-当前 token 使用量 → 与上下文窗口比较
-    → 超过阈值 → 触发压缩
-    → 低于最小值 → 发出警告
-    → 正常范围 → 继续运行
-```
+
+- **shouldBlock=true**: 上下文窗口过小，阻止 Agent 运行
+- **shouldWarn=true**: 发出警告但继续运行
+- **正常**: 无需干预
 
 ### 1.3 模型上下文缓存 (`src/agents/context.ts`)
 
@@ -115,17 +121,22 @@ function limitHistoryTurns(
 const BASE_CHUNK_RATIO = 0.4;   // 基础分块比例
 const MIN_CHUNK_RATIO = 0.15;   // 最小分块比例
 const SAFETY_MARGIN = 1.2;      // 20% 安全缓冲（补偿 estimateTokens 的不精确）
+const DEFAULT_PARTS = 2;         // 默认分块数
 ```
 
-### 3.2 压缩策略
+### 3.2 自适应分块比例
 
-```
-会话消息 → estimateMessagesTokens() → 超过阈值?
-    → 是 → splitMessagesByTokenShare() 分块
-        → 每块调用 generateSummary() 生成摘要
-        → mergeSummaries() 合并摘要
-        → 替换原始消息为压缩摘要
-    → 否 → 保持不变
+当消息平均大小较大时，动态减小分块比例：
+
+```typescript
+function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindow: number): number {
+  const avgRatio = (avgTokens * SAFETY_MARGIN) / contextWindow;
+  // 平均消息 > 10% 上下文窗口时减小比例
+  if (avgRatio > 0.1) {
+    return Math.max(MIN_CHUNK_RATIO, BASE_CHUNK_RATIO - avgRatio * 2);
+  }
+  return BASE_CHUNK_RATIO;
+}
 ```
 
 ### 3.3 Token 估算
@@ -140,37 +151,113 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 
 ### 3.4 消息分块
 
+**按 Token 比例分块** (`splitMessagesByTokenShare`)：
 ```typescript
-function splitMessagesByTokenShare(
-  messages: AgentMessage[],
-  parts: number = 2
-): AgentMessage[][] {
-  // 按 token 比例将消息分成大致相等的块
-  // 避免在单条消息中间切割
+// 按 token 比例将消息分成大致相等的块
+// 在消息边界切割，从不在单条消息中间切割
+function splitMessagesByTokenShare(messages: AgentMessage[], parts = 2): AgentMessage[][]
+```
+
+**按最大 Token 分块** (`chunkMessagesByMaxTokens`)：
+```typescript
+// 按固定 token 上限分块，超大单条消息独立成块
+function chunkMessagesByMaxTokens(messages: AgentMessage[], maxTokens: number): AgentMessage[][]
+```
+
+### 3.5 多阶段摘要生成 (`summarizeInStages`)
+
+完整的压缩流程支持渐进式回退：
+
+```
+消息列表 → 数量/token 够大? → splitMessagesByTokenShare() 分块
+    → 每块 → summarizeWithFallback()
+        → 尝试完整摘要 → 成功 → 部分摘要
+        → 失败 → 回退 1: 跳过超大消息 (>50% 上下文窗口)，仅摘要小消息
+        → 失败 → 回退 2: 生成统计描述 "Context contained N messages (M oversized)"
+    → 所有部分摘要 → mergeSummaries() → 最终摘要
+```
+
+**合并指令**: "Merge these partial summaries into a single cohesive summary. Preserve decisions, TODOs, open questions, and any constraints."
+
+**重试机制**：每次 `generateSummary()` 调用使用 `retryAsync`，最多 3 次尝试，指数退避 500ms-5000ms，20% 抖动。
+
+### 3.6 历史修剪 (`pruneHistoryForContextShare`)
+
+当历史超过上下文预算时，渐进式丢弃最早的消息：
+
+```typescript
+function pruneHistoryForContextShare(params: {
+  messages: AgentMessage[];
+  maxContextTokens: number;
+  maxHistoryShare?: number;  // 默认 0.5 (历史最多占上下文的 50%)
+}): {
+  messages: AgentMessage[];
+  droppedMessagesList: AgentMessage[];  // 用于生成摘要
+  droppedChunks: number;
+  droppedTokens: number;
+  keptTokens: number;
+  budgetTokens: number;
 }
 ```
 
-### 3.5 摘要生成
+丢弃后自动修复 tool_use/tool_result 配对 (`repairToolUseResultPairing`)，删除孤立的 tool_result。
 
-每个分块调用 LLM 生成摘要，然后合并：
-
-```
-分块1 → generateSummary() → 摘要1 ─┐
-分块2 → generateSummary() → 摘要2 ──┼→ mergeSummaries() → 最终摘要
-分块N → generateSummary() → 摘要N ─┘
-```
-
-合并指令: "Merge these partial summaries into a single cohesive summary. Preserve decisions, TODOs, open questions, and any constraints."
-
-### 3.6 压缩安全
+### 3.7 压缩安全
 
 - 工具结果的 `details` 字段在压缩前被剥离（防止不可信数据进入 LLM）
-- 压缩有重试机制 (`retryAsync`)
+- `isOversizedForSummary()`: 单条消息超过上下文 50% 时跳过
 - 压缩超时保护 (`compaction-safety-timeout`)
+- AbortError 不重试
 
 ## 4. 记忆系统
 
-### 4.1 核心记忆模块 (`extensions/memory-core/`)
+### 4.1 记忆搜索配置 (`src/agents/memory-search.ts`)
+
+记忆系统通过 `ResolvedMemorySearchConfig` 配置，支持深度定制：
+
+```typescript
+type ResolvedMemorySearchConfig = {
+  enabled: boolean;
+  sources: Array<"memory" | "sessions">;       // 搜索源
+  provider: "openai" | "local" | "gemini" | "voyage" | "auto";  // 嵌入供应商
+  fallback: "openai" | "gemini" | "local" | "voyage" | "none";  // 回退供应商
+  store: {
+    driver: "sqlite";
+    path: string;                               // 默认: {stateDir}/memory/{agentId}.sqlite
+    vector: { enabled: boolean; extensionPath?: string };
+  };
+  chunking: { tokens: number; overlap: number };  // 默认: 400 tokens, 80 overlap
+  query: {
+    maxResults: number;       // 默认: 6
+    minScore: number;         // 默认: 0.35
+    hybrid: {                 // 混合搜索配置
+      enabled: boolean;       // 默认: true
+      vectorWeight: number;   // 默认: 0.7
+      textWeight: number;     // 默认: 0.3
+      candidateMultiplier: number;  // 默认: 4
+      mmr: { enabled: boolean; lambda: number };       // 最大边际相关性
+      temporalDecay: { enabled: boolean; halfLifeDays: number };  // 时间衰减
+    };
+  };
+  sync: {
+    onSessionStart: boolean;  // 会话开始时同步
+    onSearch: boolean;        // 搜索前同步
+    watch: boolean;           // 文件监听
+    watchDebounceMs: number;  // 默认: 1500ms
+    sessions: { deltaBytes: number; deltaMessages: number };  // 默认: 100KB/50条
+  };
+};
+```
+
+**嵌入模型默认值**：
+
+| 供应商 | 默认模型 |
+|--------|---------|
+| OpenAI | `text-embedding-3-small` |
+| Gemini | `gemini-embedding-001` |
+| Voyage | `voyage-4-large` |
+
+### 4.2 核心记忆模块 (`extensions/memory-core/`)
 
 提供基于文件的长期记忆存储：
 
@@ -179,7 +266,7 @@ function splitMessagesByTokenShare(
 - 记忆搜索通过 `memory_search` 工具
 - 记忆获取通过 `memory_get` 工具
 
-### 4.2 向量记忆 (`extensions/memory-lancedb/`)
+### 4.3 向量记忆 (`extensions/memory-lancedb/`)
 
 基于 LanceDB 的向量检索记忆系统：
 
@@ -187,18 +274,36 @@ function splitMessagesByTokenShare(
 - 支持语义搜索
 - 适用于大量记忆数据的高效检索
 
-### 4.3 记忆工具 (`src/agents/memory-search.ts`)
+### 4.4 SQLite 存储 (`memory-search.ts`)
 
-Agent 可通过内置工具访问记忆系统：
+记忆存储使用 SQLite 作为驱动：
+
+- 路径: `{stateDir}/memory/{agentId}.sqlite`，支持 `{agentId}` 模板变量
+- 支持 SQLite 向量扩展 (`vector.extensionPath`)
+- 嵌入缓存减少重复计算
+
+### 4.5 混合搜索系统
+
+默认启用混合搜索（向量 + 关键词）：
 
 ```
-## Memory Recall (系统提示词中)
+查询 → 向量搜索 (权重 0.7) + 关键词搜索 (权重 0.3)
+    → 合并候选 (candidateMultiplier=4, 即搜索 maxResults×4 个候选)
+    → [可选] MMR 去重 (lambda=0.7)
+    → [可选] 时间衰减 (halfLife=30天)
+    → 返回 top maxResults (默认 6)，过滤 minScore < 0.35
+```
+
+### 4.6 记忆工具 (系统提示词中)
+
+```
+## Memory Recall
 Before answering anything about prior work, decisions, dates, people,
 preferences, or todos: run memory_search on MEMORY.md + memory/*.md;
 then use memory_get to pull only the needed lines.
 ```
 
-### 4.4 记忆引用模式 (`MemoryCitationsMode`)
+### 4.7 记忆引用模式 (`MemoryCitationsMode`)
 
 ```typescript
 type MemoryCitationsMode = "off" | "on";
@@ -211,11 +316,29 @@ type MemoryCitationsMode = "off" | "on";
 
 ### 5.1 引导文件 (`src/agents/bootstrap-files.ts`)
 
-Agent 启动时加载初始上下文文件：
+Agent 启动时加载初始上下文文件，经过两阶段处理：
 
-- `AGENTS.md` / `CLAUDE.md`: 项目级指南
-- 工作区特定的引导文件
-- Agent 配置中指定的额外文件
+```typescript
+async function resolveBootstrapContextForRun(params: {
+  workspaceDir: string;
+  config?: OpenClawConfig;
+  sessionKey?: string;
+  agentId?: string;
+}): Promise<{
+  bootstrapFiles: WorkspaceBootstrapFile[];
+  contextFiles: EmbeddedContextFile[];
+}>
+```
+
+**加载流程**：
+1. `loadWorkspaceBootstrapFiles()` — 扫描工作区发现引导文件
+2. `filterBootstrapFilesForSession()` — 按会话键过滤
+3. `applyBootstrapHookOverrides()` — 应用钩子覆盖
+4. `buildBootstrapContextFiles()` — 构建上下文文件（受大小限制）
+
+**文件类型**: `AGENTS.md` / `CLAUDE.md`（项目级指南）、工作区特定引导文件、Agent 配置指定的额外文件
+
+**大小限制**: 通过 `resolveBootstrapMaxChars()` 和 `resolveBootstrapTotalMaxChars()` 控制单文件和总量上限。
 
 ### 5.2 上下文文件 (`EmbeddedContextFile`)
 
@@ -260,11 +383,32 @@ Agent 运行 → buildSystemPrompt()
 
 ### 7.1 转录策略 (`src/agents/transcript-policy.ts`)
 
-控制会话转录的保留和清理策略：
+根据 LLM 供应商动态调整转录处理策略：
 
-- 转录大小限制
-- 自动清理过期转录
-- 安全保护（防止敏感信息泄露）
+```typescript
+type TranscriptPolicy = {
+  sanitizeMode: "full" | "images-only";    // 内容清理模式
+  sanitizeToolCallIds: boolean;             // 工具调用 ID 卫生化
+  toolCallIdMode?: "strict" | "strict9";   // ID 格式 (Mistral 用 strict9)
+  repairToolUseResultPairing: boolean;      // 修复工具配对
+  preserveSignatures: boolean;              // 保留签名
+  sanitizeThinkingSignatures: boolean;      // 清理思考签名
+  dropThinkingBlocks: boolean;              // 丢弃思考块 (GitHub Copilot Claude)
+  applyGoogleTurnOrdering: boolean;         // Google 消息顺序修复
+  validateGeminiTurns: boolean;             // Gemini 轮次验证
+  validateAnthropicTurns: boolean;          // Anthropic 轮次验证
+  allowSyntheticToolResults: boolean;       // 允许合成工具结果
+};
+```
+
+**供应商特定行为**：
+
+| 供应商 | 清理模式 | 工具 ID 卫生化 | 配对修复 | 轮次排序 |
+|--------|---------|---------------|---------|---------|
+| Anthropic | full | strict | yes | no |
+| Google/Gemini | full | strict | yes | yes |
+| Mistral | full | strict9 | no | no |
+| OpenAI | images-only | no | no | no |
 
 ### 7.2 会话文件修复 (`src/agents/session-file-repair.ts`)
 
@@ -277,7 +421,10 @@ Agent 运行 → buildSystemPrompt()
 ### 7.3 转录修复 (`src/agents/session-transcript-repair.ts`)
 
 ```typescript
-function repairToolUseResultPairing(messages: AgentMessage[]): AgentMessage[]
+function repairToolUseResultPairing(messages: AgentMessage[]): {
+  messages: AgentMessage[];
+  droppedOrphanCount: number;   // 被丢弃的孤立 tool_result 数量
+}
 function stripToolResultDetails(messages: AgentMessage[]): AgentMessage[]
 ```
 

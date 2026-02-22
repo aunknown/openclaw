@@ -146,32 +146,83 @@ Skill 从多个目录加载并合并：
 
 ### 3.2 加载步骤 (`src/agents/skills/workspace.ts`)
 
-1. **发现**: `loadWorkspaceSkillEntries()` 扫描所有 Skill 目录
-2. **解析**: `loadSkillsFromDir()` (from `pi-coding-agent`) 读取每个 SKILL.md
-3. **Frontmatter 解析**: `parseFrontmatter()` 提取 YAML 头部
-4. **元数据解析**: `resolveOpenClawMetadata()` 提取 OpenClaw 特有配置
-5. **路径压缩**: `compactSkillPaths()` 将 home 路径替换为 `~` 节省 token
+`loadSkillEntries()` 从 6 个层级源加载 Skill，优先级从低到高：
 
-### 3.3 Skill 过滤
+```
+Extra Dirs < Bundled < Managed < Agents-Personal < Agents-Project < Workspace
+```
+
+**源路径**：
+1. **Extra Dirs**: 用户配置路径 (`config.skills.load.extraDirs`)
+2. **Bundled**: `resolveBundledSkillsDir()` — 随 OpenClaw 安装
+3. **Managed**: `{CONFIG_DIR}/skills` (如 `~/.config/openclaw/skills`)
+4. **Personal Agents**: `~/.agents/skills`
+5. **Project Agents**: `{workspaceDir}/.agents/skills`
+6. **Workspace**: `{workspaceDir}/skills`
+
+后加载的源通过 `Map<name, Skill>` 合并覆盖先加载的。
+
+**每个源目录的发现流程**：
+1. `listChildDirectories()` 枚举子目录（跳过隐藏目录和 `node_modules`）
+2. 可疑检查: 超过 `maxCandidatesPerRoot` (默认 300) 时警告并截断
+3. 对每个子目录（上限 `maxSkillsLoadedPerSource`，默认 200）：
+   - 验证 `{child}/SKILL.md` 存在
+   - 大小检查: 拒绝超过 256KB 的 SKILL.md
+   - 通过 `loadSkillsFromDir()` 加载
+4. `resolveOpenClawMetadata()` 提取 OpenClaw 特有配置
+5. `compactSkillPaths()` 将 home 路径替换为 `~` 节省约 5-6 tokens/skill
+
+**关键常量**：
+
+```typescript
+const DEFAULT_MAX_CANDIDATES_PER_ROOT = 300;
+const DEFAULT_MAX_SKILLS_LOADED_PER_SOURCE = 200;
+const DEFAULT_MAX_SKILLS_IN_PROMPT = 150;
+const DEFAULT_MAX_SKILLS_PROMPT_CHARS = 30_000;
+const DEFAULT_MAX_SKILL_FILE_BYTES = 256_000;
+```
+
+### 3.3 Skill 过滤 (`src/agents/skills/filter.ts`, `config.ts`)
 
 加载后的 Skill 经过多层过滤：
 
+**`shouldIncludeSkill()` 决策树**（按顺序）：
+
+1. **配置禁用**: `skillConfig.enabled === false` → 拒绝
+2. **内置黑名单**: 不在 `allowBundled` 允许列表 → 拒绝
+3. **平台不匹配**: Skill 声明的 `os: [...]` 与当前平台不兼容 → 拒绝
+4. **始终加载覆盖**: `metadata.always === true` → 接受（跳过后续检查）
+5. **运行时依赖检查** (`evaluateRuntimeRequires()`):
+   - `requires.bins`: 所有二进制必须存在
+   - `requires.anyBins`: 至少一个二进制存在
+   - `requires.env`: 所有环境变量必须设置
+   - `requires.config`: 配置路径必须有效
+
+**过滤器规范化**：
+
 ```typescript
-function filterSkillEntries(
-  entries: SkillEntry[],
-  config?: OpenClawConfig,
-  skillFilter?: string[],
-  eligibility?: SkillEligibilityContext,
-): SkillEntry[]
+function normalizeSkillFilter(skillFilter?: ReadonlyArray<unknown>): string[] | undefined
+// 输入: ["github", "  ", "git", null, ""]
+// 输出: ["github", "git"]
 ```
 
-过滤条件：
-- `shouldIncludeSkill()`: 检查二进制依赖、环境变量、配置路径
-- 操作系统兼容性检查
-- 用户配置的 Skill 过滤器
-- 内置允许列表 (`resolveBundledAllowlist`)
+### 3.4 提示词限制（二分搜索）
 
-### 3.4 Skill 同步
+`applySkillsPromptLimits()` 两阶段截断：
+
+1. **数量限制**: 最多 `maxSkillsInPrompt` (默认 150) 个 Skill
+2. **字符限制**: 若仍超过 `maxSkillsPromptChars` (默认 30KB)，使用二分搜索找到最大可容纳的前缀
+
+```typescript
+let lo = 0, hi = skillsForPrompt.length;
+while (lo < hi) {
+  const mid = Math.ceil((lo + hi) / 2);
+  if (fits(skillsForPrompt.slice(0, mid))) lo = mid;
+  else hi = mid - 1;
+}
+```
+
+### 3.5 Skill 同步
 
 `syncSkillsToWorkspace()` 将远程/管理的 Skill 同步到工作区目录。
 
@@ -258,6 +309,18 @@ type SkillCommandSpec = {
 
 从 Skill frontmatter 中提取命令定义，生成命令规格列表。
 
+**命令名卫生化**：
+
+```typescript
+function sanitizeSkillCommandName(raw: string): string
+// "My-API@Tool v2" → "my_api_tool_v2"
+// 规则: 小写 → 非字母数字替换为 _ → 合并连续 _ → 去首尾 _ → 截断到 32 字符
+```
+
+**命令名去重**：若命令名冲突，自动添加 `_2`, `_3` 等后缀（最多尝试到 `_999`）。
+
+**描述截断**: 最多 100 字符（Discord 限制）。
+
 ### 6.3 命令执行
 
 用户输入 `/command args` 时：
@@ -272,17 +335,54 @@ type SkillCommandSpec = {
 Skill 可声明安装依赖，系统自动安装：
 
 ```typescript
-type SkillInstallSpec = {
-  kind: "brew" | "node" | "go" | "uv" | "download";
-  // brew: 使用 Homebrew 安装
-  // node: 使用 npm/pnpm/yarn/bun 安装
-  // go: 使用 go install 安装
-  // uv: 使用 uv (Python) 安装
-  // download: 直接下载二进制
+type SkillInstallRequest = {
+  workspaceDir: string;
+  skillName: string;
+  installId: string;           // resolveInstallId(spec, index) → "{kind}-{index}"
+  timeoutMs?: number;          // 限制 1-900 秒
+  config?: OpenClawConfig;
+};
+
+type SkillInstallResult = {
+  ok: boolean;
+  message: string;
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  warnings?: string[];         // 安全扫描警告
 };
 ```
 
-### 7.2 安装偏好 (`resolveSkillsInstallPreferences`)
+### 7.2 各安装类型的命令生成
+
+| 类型 | 命令 | 说明 |
+|------|------|------|
+| **brew** | `brew install {formula}` | Homebrew 安装 |
+| **node** | `{npm\|pnpm\|yarn\|bun} install -g --ignore-scripts {package}` | Node 全局安装，强制 `--ignore-scripts` |
+| **go** | `go install {module}` | Go 工具安装 |
+| **uv** | `uv tool install {package}` | Python UV 安装 |
+| **download** | 自定义下载 + 解压 | 支持 tar.gz/tar.bz2/zip |
+
+### 7.3 前置依赖自动安装
+
+安装前自动检查所需工具链是否存在：
+
+- **UV**: 若 `uv` 不在 PATH，尝试 `brew install uv`
+- **Go**: 若 `go` 不在 PATH，尝试 `brew install go` 或 `apt-get install golang-go`
+- **Brew 二进制目录**: `resolveBrewBinDir()` 依次尝试 `brew --prefix`、`$HOMEBREW_PREFIX`、回退路径
+
+### 7.4 安全扫描
+
+```typescript
+async function collectSkillInstallScanWarnings(entry: SkillEntry): Promise<string[]>
+```
+
+安装前通过 `scanDirectoryWithSummary()` 扫描 Skill 目录：
+- 危险代码模式 → WARNING
+- 可疑代码模式 → 提示运行审计
+- 扫描失败 → 记录但继续安装
+
+### 7.5 安装偏好
 
 ```typescript
 function resolveSkillsInstallPreferences(config?: OpenClawConfig): {
@@ -290,13 +390,6 @@ function resolveSkillsInstallPreferences(config?: OpenClawConfig): {
   nodeManager: "npm" | "pnpm" | "yarn" | "bun";  // Node 包管理器
 }
 ```
-
-### 7.3 安装流程
-
-1. 检查 Skill 声明的依赖是否已安装
-2. 按 `SkillInstallSpec` 中的规格执行安装
-3. 支持下载 tar.bz2 归档 (`skills-install-download.ts`)
-4. 安装状态跟踪 (`skills-status.ts`)
 
 ## 8. 内置 Skill 列表
 
@@ -346,17 +439,150 @@ function shouldIncludeSkill(params: {
 
 ### 9.2 环境覆盖 (`src/agents/skills/env-overrides.ts`)
 
-Skill 可通过 `applySkillEnvOverrides()` 在运行时覆盖环境变量。
+Skill 可通过 `applySkillEnvOverrides()` 在运行时覆盖环境变量：
+
+**安全硬性阻止列表**：
+
+```typescript
+const HARD_BLOCKED_SKILL_ENV_PATTERNS: ReadonlyArray<RegExp> = [
+  /^NODE_OPTIONS$/i,
+  /^OPENSSL_CONF$/i,
+  /^LD_PRELOAD$/i,
+  /^DYLD_INSERT_LIBRARIES$/i,
+];
+```
+
+阻止原因: 防止加载器操纵注入代码。
+
+**覆盖流程**：
+1. 遍历所有 Skill 的配置 (`config.skills.entries[skillKey]`)
+2. 对每个 Skill 的 `env` 字段进行卫生化 (`sanitizeSkillEnvOverrides`)
+3. 仅允许 `requires.env` 和 `primaryEnv` 中声明的敏感变量
+4. 验证值（检查 null 字节等）
+5. 返回环境恢复器函数，运行结束后恢复 `process.env`
+
+**配置来源**：
+```typescript
+// config.skills.entries[skillKey]
+{
+  env?: Record<string, string>;   // 键值覆盖
+  apiKey?: string;                 // 填充到 primaryEnv
+}
+```
 
 ## 10. Skill 刷新机制
 
-### 10.1 监听变更 (`src/agents/skills/refresh.ts`)
+### 10.1 文件监听 (`src/agents/skills/refresh.ts`)
 
-`registerSkillsChangeListener()` 注册文件变更监听器：
+基于 `chokidar` 的文件监听，支持 Gateway 运行时热重载。
 
-- 监控 Skill 目录的文件变更
-- 变更时自动重新加载 Skill 列表
-- Gateway 运行时热重载
+**监听路径**：
+- `{workspaceDir}/skills/`
+- `{workspaceDir}/.agents/skills/`
+- `{CONFIG_DIR}/skills/`
+- `~/.agents/skills/`
+- 额外配置目录和插件 Skill 目录
+
+**监听目标** (Glob 模式)：
+- `{root}/SKILL.md` — 根级 Skill
+- `{root}/*/SKILL.md` — 子目录 Skill
+
+**忽略模式**：
+
+```typescript
+const DEFAULT_SKILLS_WATCH_IGNORED: RegExp[] = [
+  /(^|[\\/])\.git([\\/]|$)/,
+  /(^|[\\/])node_modules([\\/]|$)/,
+  /(^|[\\/])dist([\\/]|$)/,
+  /(^|[\\/])\.venv([\\/]|$)/,
+  /(^|[\\/])__pycache__([\\/]|$)/,
+  // ... 更多构建目录
+];
+```
+
+### 10.2 版本跟踪与热重载
+
+```typescript
+const workspaceVersions = new Map<string, number>();
+let globalVersion = 0;
+
+type SkillsChangeEvent = {
+  workspaceDir?: string;
+  reason: "watch" | "manual" | "remote-node";
+  changedPath?: string;
+};
+
+function registerSkillsChangeListener(
+  listener: (event: SkillsChangeEvent) => void
+): () => void  // 返回注销函数
+```
+
+文件变更通过 250ms 防抖后触发 `bumpSkillsSnapshotVersion()`，通知所有注册的监听器重新加载 Skill 列表。
+
+## 11. 插件 Skill 发现 (`src/agents/skills/plugin-skills.ts`)
+
+`resolvePluginSkillDirs()` 从插件清单注册表中发现 Skill 目录：
+
+1. 加载插件清单注册表 (`loadPluginManifestRegistry()`)
+2. 对每个声明了 `skills` 的插件：
+   - 检查启用状态 (`resolveEnableState`)
+   - 检查记忆槽位决策 (`resolveMemorySlotDecision`) — 同一槽位仅允许一个记忆插件
+3. 去重并验证路径存在
+
+## 12. 实际 SKILL.md 示例
+
+### 示例 1: openai-image-gen (带安装依赖)
+
+```yaml
+---
+name: openai-image-gen
+description: Batch-generate images via OpenAI Images API.
+metadata:
+  openclaw:
+    emoji: "🖼️"
+    requires: { bins: ["python3"], env: ["OPENAI_API_KEY"] }
+    primaryEnv: OPENAI_API_KEY
+    install:
+      - id: python-brew
+        kind: brew
+        formula: python
+        bins: ["python3"]
+        label: "Install Python (brew)"
+---
+```
+
+### 示例 2: spotify-player (anyBins 条件)
+
+```yaml
+---
+name: spotify-player
+description: Terminal Spotify playback/search via spogo or spotify_player.
+metadata:
+  openclaw:
+    emoji: "🎵"
+    requires: { anyBins: ["spogo", "spotify_player"] }
+    install:
+      - id: brew
+        kind: brew
+        formula: spogo
+        bins: ["spogo"]
+      - id: brew
+        kind: brew
+        formula: spotify_player
+        bins: ["spotify_player"]
+---
+```
+
+### 示例 3: prose (纯文档型)
+
+```yaml
+---
+name: prose
+description: OpenProse VM skill pack.
+metadata:
+  openclaw: { emoji: "🪶", homepage: "https://www.prose.md" }
+---
+```
 
 ## 关键源码文件索引
 

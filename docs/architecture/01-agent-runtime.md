@@ -81,14 +81,20 @@ Agent 的核心运行逻辑位于 `src/agents/pi-embedded-runner/` 目录：
 ```
 消息到达 → resolveAgentRoute() → resolveSessionKey()
     → runEmbeddedPiAgent()
-        → resolveModel()           // 解析使用的模型
-        → buildEmbeddedRunPayloads() // 构建 LLM 请求
-        → runEmbeddedAttempt()      // 执行 LLM 调用
-            ← 流式响应处理
-            ← 工具调用执行
-            ← 错误重试/故障转移
-        → compactIfNeeded()         // 上下文过长时压缩
+        → enqueueSession → enqueueGlobal (双层队列)
+            → resolveRunWorkspaceDir()   // 解析工作目录
+            → resolveModel()             // 解析模型+供应商
+            → getApiKeyForModel()        // 获取 API 密钥
+            → resolveContextWindowInfo() // 上下文窗口守卫
+            → buildEmbeddedRunPayloads() // 构建 LLM 请求
+            → runEmbeddedAttempt()       // 执行 LLM 调用
+                ← 流式响应处理
+                ← 工具调用执行
+                ← 错误分类 → 故障转移/重试
+            → compactIfNeeded()          // 上下文过长时压缩
 ```
+
+**双层排队**: 每次运行通过 Session Lane（保证同一会话串行）和 Global Lane（全局并发控制）双重排队。
 
 ### 2.3 关键运行参数 (`RunEmbeddedPiAgentParams`)
 
@@ -102,15 +108,48 @@ Agent 的核心运行逻辑位于 `src/agents/pi-embedded-runner/` 目录：
 - **tools**: 可用工具集合
 - **messages**: 会话消息历史
 
-### 2.4 运行状态管理 (`runs.ts`)
+### 2.4 Token 使用量跟踪
 
-系统维护全局的活跃运行追踪：
+系统通过 `UsageAccumulator` 精确跟踪每次运行的 token 消耗：
 
-- `queueEmbeddedPiMessage()`: 将新消息排入运行队列
-- `isEmbeddedPiRunActive()`: 检查指定会话是否有活跃运行
-- `isEmbeddedPiRunStreaming()`: 检查是否正在流式传输
-- `abortEmbeddedPiRun()`: 中止指定会话的运行
-- `waitForEmbeddedPiRunEnd()`: 等待运行完成
+```typescript
+type UsageAccumulator = {
+  input: number;         // 累计输入 token
+  output: number;        // 累计输出 token
+  cacheRead: number;     // 累计缓存读取
+  cacheWrite: number;    // 累计缓存写入
+  total: number;         // 累计总量
+  lastCacheRead: number; // 最近一次 API 调用的缓存读取（非累计）
+  lastCacheWrite: number;
+  lastInput: number;
+};
+```
+
+**关键设计**: 使用最近一次 API 调用的缓存字段（而非累计）计算上下文大小，因为多轮工具调用中累计的 `cacheRead` 会 N 倍膨胀。
+
+### 2.5 运行状态管理 (`runs.ts`)
+
+系统通过全局 `ACTIVE_EMBEDDED_RUNS` Map 追踪活跃运行：
+
+```typescript
+type EmbeddedPiQueueHandle = {
+  queueMessage: (text: string) => Promise<void>;
+  isStreaming: () => boolean;
+  isCompacting: () => boolean;
+  abort: () => void;
+};
+
+const ACTIVE_EMBEDDED_RUNS = new Map<string, EmbeddedPiQueueHandle>();
+```
+
+**消息排队条件**: `queueEmbeddedPiMessage()` 仅在活跃运行存在、正在流式传输、且未在压缩时接受消息。
+
+**等待机制**: `waitForEmbeddedPiRunEnd()` 支持超时等待（默认 15 秒），使用 waiter 集合通知所有等待者。
+
+### 2.6 安全处理
+
+- **Anthropic 拒绝魔法字符串**: 自动将 `ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL` 替换为脱敏版本，防止会话污染
+- **工具结果截断**: `truncateOversizedToolResultsInSession()` 在运行前截断超大工具结果
 
 ## 3. 多 Agent 系统
 
@@ -163,12 +202,34 @@ OpenClaw 支持多 Agent 配置：
 
 ### 4.3 故障转移 (`src/agents/model-fallback.ts`)
 
-当 LLM 调用失败时的故障转移机制：
+当 LLM 调用失败时的多层故障转移机制：
 
-- 自动检测错误类型 (认证、计费、限流、超时)
-- 按优先级尝试备用认证配置
-- 标记失败的配置并记录冷却期
-- 支持手动指定降级思考级别
+**错误分类** (`FailoverReason`):
+- 认证错误 (`auth`) — API 密钥无效
+- 计费错误 (`billing`) — 账户余额不足
+- 限流错误 (`rate-limit`) — 请求频率过高
+- 超时错误 (`timeout`) — 请求超时
+- 上下文溢出 (`context-overflow`) — 输入超过模型限制
+- 图片尺寸错误 (`image-size`, `image-dimension`)
+- 压缩失败 (`compaction-failure`)
+
+**故障转移候选收集** (`ModelCandidate`):
+```typescript
+type ModelCandidate = { provider: string; model: string };
+// 通过 createModelCandidateCollector() 去重收集
+// 按配置的允许列表过滤
+// 支持模型别名解析 (buildModelAliasIndex)
+```
+
+**故障转移流程**:
+1. 主模型失败 → 分类错误原因
+2. AbortError（非超时）→ 直接重抛，不进入故障转移
+3. 按优先级尝试 `config.agents.defaults.model.fallbacks` 中的备用模型
+4. 标记失败的认证配置进入冷却期 (`markAuthProfileFailure`)
+5. 所有候选耗尽 → 汇总所有尝试的错误摘要
+6. 支持思考级别降级 (`pickFallbackThinkingLevel`)
+
+**图片生成故障转移**: 独立的候选解析（`resolveImageFallbackCandidates`），支持 `agents.defaults.imageModel.fallbacks`。
 
 ## 5. 工具系统
 
@@ -219,21 +280,30 @@ LLM 请求工具调用 → 工具策略检查 (tool-policy.ts)
 6. 工作区与运行时上下文
 7. 当前时间信息
 
-## 7. 进程管理
+## 7. 进程与并发管理
 
-### 7.1 命令队列 (`src/process/command-queue.ts`)
+### 7.1 Lane 并发系统 (`src/agents/pi-embedded-runner/lanes.ts`)
 
-所有 Agent 运行通过命令队列调度：
+Agent 运行使用双层 Lane 排队：
 
-- Lane (通道) 级别的并发控制
-- 队列大小监控
-- 支持优先级排队
+- **Session Lane** (`resolveSessionLane`): 保证同一会话的请求串行处理
+- **Global Lane** (`resolveGlobalLane`): 全局并发控制，防止过载
 
-### 7.2 进程执行 (`src/process/exec.ts`)
+每次 `runEmbeddedPiAgent()` 调用通过 `enqueueSession(() => enqueueGlobal(async () => ...))` 嵌套排队。
+
+### 7.2 命令队列 (`src/process/command-queue.ts`)
+
+`enqueueCommandInLane()` 实现 Lane 级 FIFO 排队：
+
+- 基于 Lane 名称的隔离队列
+- 全局队列大小监控
+- 支持异步等待队列完成
+
+### 7.3 进程执行 (`src/process/exec.ts`)
 
 - `runExec()`: 带超时的命令执行
 - `runCommandWithTimeout()`: 限时命令执行
-- 子进程桥接 (`child-process-bridge.ts`): 信号转发
+- 子进程桥接 (`child-process-bridge.ts`): 信号转发（SIGINT, SIGTERM）
 
 ## 8. 关键数据流
 
