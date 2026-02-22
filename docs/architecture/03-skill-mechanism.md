@@ -393,31 +393,29 @@ function resolveSkillsInstallPreferences(config?: OpenClawConfig): {
 
 ## 8. 内置 Skill 列表
 
-项目根目录 `skills/` 包含以下内置 Skill：
+项目根目录 `skills/` 包含 52 个内置 Skill：
 
-| Skill | 描述 |
-|-------|------|
-| `weather` | 天气查询 |
-| `slack` | Slack 工作区交互 |
-| `notion` | Notion 集成 |
-| `apple-reminders` | Apple 提醒事项 |
-| `things-mac` | Things (macOS) 任务管理 |
-| `spotify-player` | Spotify 播放控制 |
-| `clawhub` | ClawHub 集成 |
-| `nano-pdf` | PDF 处理 |
-| `nano-banana-pro` | Banana Pro 集成 |
-| `summarize` | 内容摘要 |
-| `gifgrep` | GIF 搜索 |
-| `openai-image-gen` | OpenAI 图像生成 |
+| 分类 | Skill 列表 |
+|------|-----------|
+| **生产力** | `apple-notes`, `apple-reminders`, `bear-notes`, `notion`, `obsidian`, `things-mac`, `trello` |
+| **通讯** | `slack`, `discord`, `imsg`, `bluebubbles`, `wacli` (WhatsApp), `himalaya` (email) |
+| **开发** | `github`, `gh-issues`, `tmux`, `coding-agent`, `clawhub` |
+| **媒体** | `spotify-player`, `songsee`, `sonoscli`, `openai-image-gen`, `video-frames`, `gifgrep`, `camsnap`, `peekaboo`, `canvas` |
+| **AI/语音** | `gemini`, `openai-whisper`, `openai-whisper-api`, `sherpa-onnx-tts`, `voice-call` |
+| **文档** | `nano-pdf`, `summarize`, `blogwatcher` |
+| **系统** | `weather`, `healthcheck`, `session-logs`, `model-usage`, `skill-creator` |
+| **工具** | `food-order`, `goplaces`, `oracle`, `ordercli`, `sag`, `sherpa-onnx-tts` |
+| **智能家居** | `openhue` |
+| **其他** | `1password`, `blucli`, `eightctl`, `gog`, `mcporter`, `nano-banana-pro` |
 
 ### 扩展 Skill
 
 扩展也可以提供 Skill：
 
-| 扩展 | Skill 目录 |
-|------|-----------|
-| `extensions/feishu/skills/` | 飞书特有技能 |
-| `extensions/open-prose/skills/` | 文本编辑技能 |
+| 扩展 | Skill 目录 | 内容 |
+|------|-----------|------|
+| `extensions/feishu/skills/` | 飞书特有技能 | `feishu-doc`, `feishu-drive`, `feishu-perm`, `feishu-wiki` |
+| `extensions/open-prose/skills/` | 文本编辑技能 | `prose` — OpenProse VM 技能包 |
 
 ## 9. Skill 配置 (`src/agents/skills/config.ts`)
 
@@ -584,6 +582,28 @@ metadata:
 ---
 ```
 
+## 13. Gateway Skill API (`src/gateway/server-methods/skills.ts`)
+
+Gateway 暴露 4 个 Skill 相关的 JSON-RPC 方法：
+
+| 方法 | 说明 |
+|------|------|
+| `skills.status` | 返回工作区 Skill 状态报告（已加载、缺失依赖等） |
+| `skills.bins` | 收集所有 Skill 声明的二进制依赖列表 |
+| `skills.install` | 安装指定 Skill 的依赖 |
+| `skills.update` | 更新 Skill 配置（API Key、环境变量等） |
+
+## 14. CLI 命令 (`src/cli/skills-cli.ts`)
+
+```bash
+openclaw skills list              # 列出所有 Skill
+openclaw skills list --eligible   # 仅显示满足条件的 Skill
+openclaw skills list --json       # JSON 格式输出
+openclaw skills list -v           # 显示缺失的依赖
+openclaw skills info <name>       # 查看指定 Skill 详情
+openclaw skills check             # 检查所有 Skill 的依赖状态
+```
+
 ## 关键源码文件索引
 
 | 文件路径 | 说明 |
@@ -600,4 +620,8 @@ metadata:
 | `src/agents/skills-install.ts` | 安装系统 |
 | `src/agents/skills-status.ts` | 安装状态 |
 | `src/agents/system-prompt.ts` | 系统提示词中的 Skill 部分 |
-| `skills/` | 内置 Skill 目录 |
+| `src/gateway/server-methods/skills.ts` | Gateway Skill API 端点 |
+| `src/cli/skills-cli.ts` | CLI skills 子命令 |
+| `src/auto-reply/skill-commands.ts` | 斜杠命令解析与派发 |
+| `skills/` | 内置 Skill 目录 (52 个) |
+| `extensions/*/skills/` | 扩展 Skill 目录 |
