@@ -331,12 +331,61 @@ type BlockReplyChunking = {
 
 ## 5. 回复派发
 
-### 5.1 回复派发器注册表 (`src/auto-reply/reply/dispatcher-registry.ts`)
+### 5.1 回复派发器 (`src/auto-reply/reply/reply-dispatcher.ts`)
 
-- `getTotalPendingReplies()`: 获取全局待发送回复数
-- 每个通道有独立的回复派发器
+`ReplyDispatcher` 管理回复的序列化发送：
 
-### 5.2 通道特定派发
+```typescript
+type ReplyDispatcher = {
+  sendToolResult: (payload: ReplyPayload) => boolean;
+  sendBlockReply: (payload: ReplyPayload) => boolean;
+  sendFinalReply: (payload: ReplyPayload) => boolean;
+  waitForIdle: () => Promise<void>;
+  markComplete: () => void;
+};
+```
+
+**生命周期**（基于 pending 计数器）：
+
+```
+初始化: pending = 1 (预留，防止过早触发 idle)
+    ↓
+sendBlockReply() → pending++ (入队) → deliver() → finally { pending-- }
+    ↓
+markComplete() → completeCalled = true → pending-- (释放预留)
+    ↓
+pending === 0 → onIdle() 触发 (Gateway 可重启、资源可清理)
+```
+
+**发送链序列化**: 所有回复通过 Promise 链排队，保持 tool → block → final 顺序，块间添加类人延迟。
+
+### 5.2 派发器注册表 (`src/auto-reply/reply/dispatcher-registry.ts`)
+
+全局注册表跟踪所有活跃的派发器：
+
+```typescript
+function registerDispatcher(dispatcher: {
+  readonly pending: () => number;
+  readonly waitForIdle: () => Promise<void>;
+}): { id: string; unregister: () => void }
+
+function getTotalPendingReplies(): number
+```
+
+确保 Gateway 重启前等待所有活跃回复完成。
+
+### 5.3 出站交付管线 (`src/infra/outbound/deliver.ts`)
+
+```
+回复负载 → normalizeReplyPayload()
+    → loadChannelOutboundAdapter(channel)
+    → 大文本分块 (按通道文本限制)
+    → sendText() / sendMedia() (调用通道 API)
+    → appendAssistantMessageToSessionTranscript() (会话镜像)
+    → triggerInternalHook("message:sent") (钩子触发)
+```
+
+### 5.4 通道特定派发
 
 以 Feishu 为例 (`extensions/feishu/src/reply-dispatcher.ts`)：
 
@@ -349,13 +398,9 @@ Agent 生成回复 → createFeishuReplyDispatcher()
     → 流式卡片更新 (streaming-card.ts)
 ```
 
-### 5.3 回复前缀 (`src/channels/reply-prefix.ts`)
+### 5.5 入站去重
 
-在多 Agent 环境中，回复可添加 Agent 标识前缀。
-
-### 5.4 Ack 反应 (`src/channels/ack-reactions.ts`)
-
-部分通道支持"已收到"反应（如表情回应），表示消息已被处理。
+`shouldSkipDuplicateInbound()` 通过缓存 `{channel}:{accountId}:{chatId}:{messageId}` 在时间窗口内去除重复消息，防止重放和重复处理。
 
 ## 6. 消息生命周期图
 
