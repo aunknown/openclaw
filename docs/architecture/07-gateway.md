@@ -74,63 +74,105 @@ startGatewayServer()
     → logGatewayStartup()         // 输出启动日志
 ```
 
-## 2. HTTP 服务器
+## 2. HTTP 服务器与 API 端点
 
 ### 2.1 HTTP 基础 (`src/gateway/server-http.ts`)
 
-Gateway 的 HTTP 服务器处理：
+Gateway 在单个端口（默认 `18789`）上多路复用 HTTP 和 WebSocket：
 
-- REST API 请求
-- Webhook 回调
-- Control UI 静态资源
-- 健康检查端点
+| 端点 | 方法 | 用途 | 文件 |
+|------|------|------|------|
+| `/v1/chat/completions` | POST | OpenAI 兼容聊天 API | `openai-http.ts` |
+| `/v1/responses` | POST | OpenResponses 协议 | `openresponses-http.ts` |
+| `/tools/invoke` | POST | 直接工具调用 | `tools-invoke-http.ts` |
+| `/hooks` | POST | Webhook 消息注入 | `hooks.ts` |
+| `/__openclaw__/canvas/*` | GET/POST | Canvas 浏览器自动化 | `server-browser.ts` |
+| `/avatar/*` | GET | Agent 头像 | `control-ui.ts` |
+| `/health` | GET | 健康检查 | `probe.ts` |
+| `/` | GET | Control UI SPA | `control-ui.ts` |
 
-### 2.2 认证 (`src/gateway/auth.ts`)
+### 2.2 认证系统 (`src/gateway/auth.ts`)
 
-```typescript
-// 认证方式
-// 1. API Token: Authorization: Bearer <token>
-// 2. 设备认证: device-auth (用于移动端)
-// 3. Origin 检查: 跨域请求验证
-```
+Gateway 支持 5 种认证模式：
+
+| 模式 | 配置 | 说明 |
+|------|------|------|
+| **Token** (默认) | `gateway.auth.token` | Bearer Token 认证，时间安全比较 |
+| **Password** | `gateway.auth.password` | 密码认证 |
+| **Trusted Proxy** | `gateway.auth.trustedProxy` | 可信代理 IP + 用户头部 |
+| **Tailscale** | `gateway.tailscale.mode="serve"` | Tailscale 用户验证 |
+| **None** | `gateway.auth.mode="none"` | 无认证 (仅限 loopback) |
+
+核心函数：
+- `resolveGatewayAuth()` (line 186): 解析认证配置
+- `authorizeGatewayConnect()` (line 322): 验证连接请求
+
+**设备认证与配对** (`device-auth.ts`):
+- 节点发送设备指纹 + 公钥
+- 挑战-响应签名验证
+- 按角色+作用域颁发设备 Token
+- 新设备需要配对审批
 
 **认证速率限制** (`auth-rate-limit.ts`):
 ```typescript
 function createAuthRateLimiter(): AuthRateLimiter
-// 防止暴力破解认证
+// 可配置的暴力破解防护
+// 超出限制返回 429 + Retry-After 头
 ```
 
-**Origin 检查** (`origin-check.ts`):
+**方法级权限** (`method-scopes.ts`):
+- `operator.read` — 只读访问
+- `operator.write` — 修改配置/会话
+- `operator.admin` — 完全访问
+- `operator.approvals` — 审批执行请求
+- `operator.pairing` — 管理设备配对
+
+## 3. WebSocket 协议
+
+### 3.1 握手序列
+
+Gateway WS 协议使用挑战-响应式握手（协议版本 3）：
+
+```
+服务器 → 客户端:  connect.challenge { nonce, ts }
+客户端 → 服务器:  connect { auth, role, scopes, device, client }
+服务器 → 客户端:  hello-ok { protocol, policy, auth: { deviceToken, role } }
+```
+
+### 3.2 帧类型
+
 ```typescript
-// 验证 WebSocket/HTTP 请求的 Origin 头
-// 防止 CSRF 攻击
+// 请求帧
+{ type: "req", id: string, method: string, params?: object }
+
+// 响应帧
+{ type: "res", id: string, ok: boolean, payload?: object, error?: { code, message } }
+
+// 事件帧 (服务器推送)
+{ type: "event", event: string, payload?: object, seq?: number, stateVersion?: object }
 ```
 
-### 2.3 HTTP 端点辅助 (`src/gateway/http-endpoint-helpers.ts`)
+### 3.3 WS 方法 (100+ RPC 方法)
 
-通用的 HTTP 端点工具：
-- 请求解析
-- 响应格式化
-- 错误处理
+Gateway 通过 WS 暴露丰富的 RPC 方法：
 
-## 3. WebSocket 服务器
+| 类别 | 方法示例 | 说明 |
+|------|---------|------|
+| **聊天** | `chat.send`, `chat.history`, `chat.abort` | 消息发送/历史/中止 |
+| **Agent** | `agent`, `agent.wait`, `agent.identity` | 运行/等待/身份 |
+| **会话** | `sessions.reset`, `sessions.list`, `sessions.describe` | 会话管理 |
+| **通道** | `channels.status`, `channels.login`, `channels.logout` | 通道操作 |
+| **配置** | `config.get`, `config.apply`, `config.patch` | 配置读写 |
+| **健康** | `health`, `status` | 状态查询 |
+| **节点** | `node.pair.request`, `node.invoke`, `node.describe` | 移动/远程节点 |
+| **审批** | `exec.approval.list`, `exec.approval.resolve` | 工具执行审批 |
+| **技能** | `skills.list`, `skills.bins`, `skills.update` | 技能管理 |
+| **定时** | `cron.schedule`, `cron.list` | 定时任务 |
+| **日志** | `logs.subscribe`, `logs.search` | 日志流/搜索 |
 
-### 3.1 WS 运行时 (`src/gateway/server-ws-runtime.ts`)
+### 3.4 服务器广播 (`src/gateway/server-broadcast.ts`)
 
-`attachGatewayWsHandlers()` 附加 WebSocket 处理器：
-
-- 连接管理
-- 消息路由
-- 心跳检测
-- 断线重连支持
-
-### 3.2 WS 日志 (`src/gateway/ws-log.ts`)
-
-WebSocket 通信的日志记录。
-
-### 3.3 服务器广播 (`src/gateway/server-broadcast.ts`)
-
-向所有连接的 WS 客户端广播事件。
+向所有连接的 WS 客户端广播实时事件（Agent 进度、通道状态变更等）。
 
 ## 4. API 方法系统
 
