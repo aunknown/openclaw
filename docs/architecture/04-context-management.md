@@ -263,16 +263,41 @@ type ResolvedMemorySearchConfig = {
 
 - 记忆以 Markdown 文件形式存储
 - 支持 `MEMORY.md` 主记忆文件和 `memory/*.md` 辅助文件
-- 记忆搜索通过 `memory_search` 工具
-- 记忆获取通过 `memory_get` 工具
+
+**`memory_search` 工具参数**:
+
+```typescript
+// 输入
+{ query: string; maxResults?: number; minScore?: number }
+
+// 输出
+{
+  results: Array<{
+    path: string; startLine: number; endLine: number;
+    score: number; snippet: string;
+    source: "memory" | "sessions";
+    citation?: string;  // 格式: "path#L{line}" 或 "path#L{start}-L{end}"
+  }>;
+  provider: string; model: string;
+  fallback: string | null;
+  citations: "on" | "off" | "auto";
+}
+```
+
+**`memory_get` 工具**: `{ path: string; from?: number; lines?: number }` → 返回指定文件的文本片段
 
 ### 4.3 向量记忆 (`extensions/memory-lancedb/`)
 
 基于 LanceDB 的向量检索记忆系统：
 
-- 将记忆片段嵌入为向量
-- 支持语义搜索
-- 适用于大量记忆数据的高效检索
+- **数据库表**: `memories`，使用 L2 距离计算相似度（`score = 1 / (1 + distance)`）
+- **向量维度**: 1536 (small) / 3072 (large)
+- **类别**: `preference | fact | decision | entity | other`
+
+**自动捕获触发**: 检测含 "remember", "prefer", "decided" 等模式的消息
+**捕获过滤**: 排除 <10 或 >500 字符、系统注入内容、>3 emoji、prompt injection 模式
+
+**提供工具**: `memory_recall` (向量搜索, 最多 5 结果), `memory_store` (存储+自动分类), `memory_forget` (按 ID/查询删除)
 
 ### 4.4 SQLite 存储 (`memory-search.ts`)
 
@@ -303,14 +328,32 @@ preferences, or todos: run memory_search on MEMORY.md + memory/*.md;
 then use memory_get to pull only the needed lines.
 ```
 
-### 4.7 记忆引用模式 (`MemoryCitationsMode`)
+### 4.7 记忆引用模式
 
 ```typescript
-type MemoryCitationsMode = "off" | "on";
+type MemoryCitationsMode = "off" | "on" | "auto";
 ```
 
-- **on**: 回复中包含 `Source: <path#line>` 引用
+- **on**: 回复中包含 `path#L{lineNumber}` 引用
 - **off**: 不包含文件路径和行号
+- **auto** (默认): 仅在私聊中显示引用（群组/频道不显示）
+
+**聊天类型推导**: 从 `sessionKey` 中检测 `:group:` 或 `:channel:` 关键字。
+
+### 4.8 QMD 后端 (`src/memory/backend-config.ts`)
+
+除内置 SQLite 后端外，还支持 QMD (Quantum Memory Daemon) 外部后端：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| 搜索模式 | `search` | `search` (快速) / `vsearch` (向量增强) / `query` (最精确) |
+| 更新间隔 | 5min | 后台同步间隔 |
+| 嵌入间隔 | 60min | 向量嵌入更新间隔 |
+| 最大结果数 | 6 | 单次搜索返回结果数 |
+| 最大片段字符 | 700 | 单个搜索片段长度 |
+| 最大注入字符 | 4,000 | 注入到提示词的总长度 |
+
+**回退策略**: QMD 后端失败时自动降级到内置 SQLite 后端，透明切换无需用户干预。
 
 ## 5. 引导上下文 (Bootstrap Context)
 
@@ -336,9 +379,26 @@ async function resolveBootstrapContextForRun(params: {
 3. `applyBootstrapHookOverrides()` — 应用钩子覆盖
 4. `buildBootstrapContextFiles()` — 构建上下文文件（受大小限制）
 
-**文件类型**: `AGENTS.md` / `CLAUDE.md`（项目级指南）、工作区特定引导文件、Agent 配置指定的额外文件
+**支持的引导文件** (按加载顺序):
+- `AGENTS.md` — Agent 定义
+- `SOUL.md` — Agent 人格/目标
+- `TOOLS.md` — 可用工具
+- `IDENTITY.md` — Agent 身份
+- `USER.md` — 用户上下文
+- `HEARTBEAT.md` — 心跳/状态
+- `BOOTSTRAP.md` — 自定义引导
+- `MEMORY.md` + `memory/*.md` — 记忆条目
 
-**大小限制**: 通过 `resolveBootstrapMaxChars()` 和 `resolveBootstrapTotalMaxChars()` 控制单文件和总量上限。
+**会话类型过滤**: 子 Agent/Cron 会话仅加载 `AGENTS.md` + `TOOLS.md`，其他会话加载全部文件。
+
+**大小限制**:
+- 单文件上限: `DEFAULT_BOOTSTRAP_MAX_CHARS = 20_000`
+- 总量上限: `DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS = 150_000`
+
+**超限截断策略**: 保留文件头部 70% + 尾部 20%，中间插入截断标记:
+```
+[...truncated, read {filename} for full content...]
+```
 
 ### 5.2 上下文文件 (`EmbeddedContextFile`)
 
@@ -496,6 +556,10 @@ session: {
 | `src/agents/session-file-repair.ts` | 会话文件修复 |
 | `src/agents/session-transcript-repair.ts` | 转录修复 |
 | `src/agents/transcript-policy.ts` | 转录策略 |
+| `src/memory/manager.ts` | 内置 SQLite 记忆管理器 |
+| `src/memory/backend-config.ts` | 记忆后端配置 (Builtin/QMD) |
+| `src/memory/search-manager.ts` | 管理器工厂 (QMD + 回退) |
+| `src/agents/tools/memory-tool.ts` | 记忆工具实现与引用 |
 | `extensions/memory-core/` | 核心记忆扩展 |
 | `extensions/memory-lancedb/` | 向量记忆扩展 |
 | `src/config/config.ts` | 配置管理 |
