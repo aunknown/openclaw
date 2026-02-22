@@ -72,42 +72,96 @@ function buildAgentMainSessionKey(params: {
 
 ## 2. 会话存储
 
-### 2.1 会话存储接口 (`src/config/sessions.ts`)
+### 2.1 存储路径
+
+每个 Agent 有独立的会话存储目录：
+
+```
+~/.openclaw/state/
+├── agents/
+│   ├── main/
+│   │   └── sessions/
+│   │       ├── sessions.json           # 会话状态存储 (JSON)
+│   │       ├── <sessionId>.jsonl       # 转录文件 (JSONL)
+│   │       └── <sessionId>-topic-<topicId>.jsonl
+│   └── sales/
+│       └── sessions/
+│           ├── sessions.json
+│           └── <sessionId>.jsonl
+└── auth/
+    └── profiles.json
+```
+
+### 2.2 SessionEntry 核心数据结构 (`src/config/sessions/types.ts`)
+
+每个会话键映射到一个 `SessionEntry`，包含丰富的状态信息：
 
 ```typescript
-function loadSessionStore(): SessionStore
-function saveSessionStore(store: SessionStore): void
-function resolveStorePath(): string
-function resolveSessionKey(params): string
-function deriveSessionKey(params): string
+type SessionEntry = {
+  // 身份与生命周期
+  sessionId: string;                  // UUID (跨重置稳定)
+  updatedAt: number;                  // 最后更新时间戳 (ms)
+  sessionFile?: string;               // JSONL 转录文件路径
+
+  // 子 Agent 嵌套
+  spawnedBy?: string;                 // 父会话键
+  spawnDepth?: number;                // 0=主, 1=子Agent, 2=孙Agent
+
+  // 模型与供应商覆盖
+  modelOverride?: string;             // 覆盖默认模型
+  providerOverride?: string;          // 覆盖默认供应商
+  authProfileOverride?: string;       // 使用的认证配置
+
+  // Token 使用量追踪
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  contextTokens?: number;             // 当前模型的上下文窗口大小
+  compactionCount?: number;           // 压缩次数
+
+  // 投递路由信息
+  channel?: string;                   // 主通道
+  lastChannel?: string;               // 最后活跃通道
+  lastTo?: string;                    // 最后收件人
+  lastAccountId?: string;             // 最后账户
+  lastThreadId?: string | number;     // 最后线程 ID
+  deliveryContext?: DeliveryContext;   // 完整投递信息
+
+  // 群组/频道元数据
+  groupId?: string;
+  subject?: string;                   // 群组主题
+  chatType?: "group" | "channel" | "direct";
+
+  // 会话策略
+  sendPolicy?: "allow" | "deny";      // 发送策略
+  queueMode?: string;                 // 消息排队行为
+  label?: string;                     // 用户标签 (最长 64 字)
+  // ... 更多字段
+};
 ```
 
-### 2.2 存储路径
+### 2.3 转录文件格式 (JSONL)
 
-会话数据存储在文件系统中：
-
-```
-~/.config/openclaw/
-├── config.yaml              # 全局配置
-├── sessions/
-│   ├── agent-default/
-│   │   ├── main/
-│   │   │   ├── transcript.json   # 会话转录
-│   │   │   └── metadata.json     # 会话元数据
-│   │   ├── discord:default:direct:123/
-│   │   └── feishu:acct1:channel:456/
-│   └── agent-vip/
-└── auth/
-    └── profiles.json        # 认证配置
+```jsonl
+{"type":"session","version":1,"id":"<sessionId>","timestamp":"2024-01-20T10:30:00Z"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}]}}
 ```
 
-### 2.3 会话数据结构
+### 2.4 存储缓存机制
 
-每个会话包含：
+```typescript
+const SESSION_STORE_CACHE = new Map<string, SessionStoreCacheEntry>();
+const DEFAULT_SESSION_STORE_TTL_MS = 45_000; // 45 秒缓存
 
-- **transcript.json**: 完整的消息转录（AgentMessage 数组）
-- **metadata.json**: 会话元数据（创建时间、最后活跃时间等）
-- **工具状态**: 工具执行的持久化状态
+// loadSessionStore() 行为:
+// 1. 检查内存缓存 (TTL 未过期 且 文件 mtime 未变)
+// 2. 缓存未命中时从磁盘读取 (Windows 支持 3 次重试)
+// 3. 自动迁移遗留字段名
+// 4. 深拷贝后缓存
+```
 
 ## 3. 会话生命周期
 
@@ -132,18 +186,70 @@ function deriveSessionKey(params): string
 
 ### 3.3 会话写入锁 (`src/agents/session-write-lock.ts`)
 
-防止对同一会话的并发写入：
+基于文件的分布式锁机制防止并发写入：
 
 ```typescript
-// 会话写入锁确保同一时刻只有一个运行可以修改会话文件
-// 使用文件锁或内存锁实现
+async function acquireSessionWriteLock(params: {
+  sessionFile: string;
+  timeoutMs?: number;        // 默认: 10s
+  staleMs?: number;          // 默认: 30min (视为死锁)
+  maxHoldMs?: number;        // 默认: 5min (看门狗释放)
+}): Promise<{ release: () => Promise<void> }>
 ```
 
-### 3.4 会话暂停与恢复
+**锁队列系统**: 每个 storePath 维护一个 FIFO 队列序列化写入。
 
-- 会话在 Gateway 重启后自动恢复
-- 子 Agent 会话可以被父 Agent 暂停/恢复
-- 未完成的工具调用在恢复后重新执行
+**原子写入**: 使用临时文件 + rename 模式：
+- Unix: `.{pid}.{uuid}.tmp` → chmod 0o600 → rename
+- Windows: 写入 + 最多 5 次重试 rename
+
+**安全保障**:
+- 进程退出时自动释放所有锁 (`process.on("exit")`)
+- 看门狗每 60s 检查并释放持有 >5min 的锁
+- 过期锁检测 (进程已死或持有时间 >30min)
+
+### 3.4 会话重置策略 (`src/config/sessions/reset.ts`)
+
+支持多种会话重置模式：
+
+| 模式 | 规则 | 默认应用 |
+|------|------|---------|
+| **daily** | 每天指定时刻重置 (默认 4:00 AM) | 私聊、群组 |
+| **idle** | 空闲超过指定分钟数重置 | 线程 (默认 60 min) |
+
+```typescript
+function evaluateSessionFreshness(params: {
+  updatedAt: number;
+  now: number;
+  policy: SessionResetPolicy;
+}): { fresh: boolean; dailyResetAt?: number; idleExpiresAt?: number }
+```
+
+可按通道/类型自定义：
+```json
+{
+  "session": {
+    "reset": { "mode": "daily", "atHour": 4 },
+    "resetByType": {
+      "direct": { "mode": "idle", "idleMinutes": 30 },
+      "thread": { "mode": "idle", "idleMinutes": 120 }
+    },
+    "resetByChannel": {
+      "slack": { "mode": "idle", "idleMinutes": 60 }
+    }
+  }
+}
+```
+
+### 3.5 存储维护 (自动清理)
+
+`saveSessionStore()` 自动执行维护：
+
+| 操作 | 条件 | 默认值 |
+|------|------|-------|
+| **修剪** | `updatedAt < now - pruneAfterMs` | 30 天 |
+| **限数** | 保留最近 N 条 | 500 条 |
+| **轮转** | 文件超过指定大小 | 10MB → 重命名为 `.bak.{timestamp}`，保留 3 个备份 |
 
 ## 4. 会话级别配置
 
